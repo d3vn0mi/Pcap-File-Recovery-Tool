@@ -48,6 +48,18 @@ def http_response_frame(filename: str, body: bytes, dport: int = 40000) -> bytes
     return tcp_frame(payload, sport=80, dport=dport)
 
 
+def tcp_frame_seq(payload: bytes, seq: int, sport: int = 80, dport: int = 40000,
+                  src: str = "10.0.0.1", dst: str = "10.0.0.2") -> bytes:
+    """TCP frame carrying an explicit sequence number.
+
+    Needed to build streams whose on-the-wire order differs from capture order,
+    which is exactly the case a reassembler has to get right.
+    """
+    return bytes(
+        Ether() / IP(src=src, dst=dst) / TCP(sport=sport, dport=dport, seq=seq) / Raw(load=payload)
+    )
+
+
 def dns_query_frame(qname: str | bytes) -> bytes:
     return bytes(
         Ether() / IP(src="10.0.0.1", dst="8.8.8.8") / UDP(sport=5353, dport=53)

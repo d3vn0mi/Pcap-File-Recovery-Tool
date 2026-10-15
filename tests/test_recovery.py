@@ -14,10 +14,166 @@ from conftest import (
     pcap_global_header,
     pcap_record,
     tcp_frame,
+    tcp_frame_seq,
 )
+from pcap_file_recovery.recovery import reassemble_tcp
 
 PNG_BYTES = b"\x89PNG\r\n\x1a\n" + b"A" * 32 + b"IEND\xaeB`\x82"
 PDF_BODY = b"%PDF-1.4 synthetic body for testing %%EOF"
+RAR_END = b"\xc4\x3d\x7b\x00\x40\x07\x00"
+
+
+# --- TCP reassembly: sequence order, not capture order ---------------------
+
+
+def test_reassemble_tcp_orders_by_sequence_number():
+    # Segments captured in reverse wire order. Concatenating in capture order
+    # would yield the same length with the two segments transposed.
+    assert reassemble_tcp([(20, b"world"), (0, b"hello ")]) == b"hello world"
+
+
+def test_reassemble_tcp_drops_retransmissions():
+    assert reassemble_tcp([(0, b"AAA"), (3, b"BBB"), (0, b"AAA")]) == b"AAABBB"
+
+
+def test_reassemble_tcp_handles_sequence_wraparound():
+    # First segment straddles the 32-bit boundary: 0xFFFFFFFE + 4 wraps to 0x2.
+    segments = [(0xFFFFFFFE, b"HEAD"), (0x2, b"TAIL")]
+    assert reassemble_tcp(segments) == b"HEADTAIL"
+
+
+def test_reassemble_tcp_keeps_identical_seq_segments_in_arrival_order():
+    # Captures that never set a sequence number all report seq 0; stable order
+    # must preserve arrival order rather than dropping segments.
+    assert reassemble_tcp([(0, b"one"), (0, b"two")]) == b"onetwo"
+
+
+def test_out_of_order_stream_carves_exact_bytes(run_tool):
+    head, tail = PNG_BYTES[:20], PNG_BYTES[20:]
+    frames = [
+        tcp_frame_seq(tail, 20),   # captured first, belongs later on the wire
+        tcp_frame_seq(head, 0),    # captured second, belongs first
+    ]
+    tool, out_dir, ok = run_tool(build_pcap(frames))
+    assert ok
+    streamed = [p.read_bytes() for p in out_dir.iterdir() if p.name.startswith("tcp_stream_")]
+    assert PNG_BYTES in streamed
+
+
+def test_retransmission_does_not_duplicate_carved_bytes(run_tool):
+    frames = [
+        tcp_frame_seq(b"\x89PNG\r\n\x1a\n", 100),
+        tcp_frame_seq(b"A" * 32, 108),
+        tcp_frame_seq(b"IEND\xaeB`\x82", 140),
+        tcp_frame_seq(b"A" * 32, 108),  # retransmission
+    ]
+    tool, out_dir, ok = run_tool(build_pcap(frames))
+    assert ok
+    streamed = [p.read_bytes() for p in out_dir.iterdir() if p.name.startswith("tcp_stream_")]
+    assert streamed and streamed[0] == PNG_BYTES
+
+
+# --- HTTP messages that span several segments -------------------------------
+
+
+def test_http_response_split_across_segments(run_tool):
+    body = b"body-arrived-in-a-later-segment" * 8
+    response = (
+        b"HTTP/1.1 200 OK\r\n"
+        b"Content-Type: application/octet-stream\r\n"
+        b"Content-Length: " + str(len(body)).encode() + b"\r\n"
+        b"\r\n" + body
+    )
+    cut = len(response) // 2
+    frames = [
+        tcp_frame_seq(response[:cut], 1000),
+        tcp_frame_seq(response[cut:], 1000 + cut),
+    ]
+    tool, out_dir, ok = run_tool(build_pcap(frames))
+    assert ok
+    recovered = [f for f in tool.recovered_files if f["source"] == "HTTP Response"]
+    assert len(recovered) == 1
+    assert (out_dir / recovered[0]["filename"]).read_bytes() == body
+
+
+def test_http_headers_and_body_in_separate_segments(run_tool):
+    # The exact original failure: the header-only packet was carved as a 0-byte
+    # file, then the packets carrying the body were skipped because they had no
+    # headers to anchor on, so the payload never reached disk.
+    headers = (
+        b"HTTP/1.1 200 OK\r\n"
+        b"Content-Type: application/octet-stream\r\n"
+        b"Content-Length: 22\r\n"
+        b"\r\n"
+    )
+    frames = [
+        tcp_frame_seq(headers, 2000),
+        tcp_frame_seq(b"body-part-a", 2000 + len(headers)),
+        tcp_frame_seq(b"body-part-b", 2000 + len(headers) + 11),
+    ]
+    tool, out_dir, ok = run_tool(build_pcap(frames))
+    assert ok
+    http = [f for f in tool.recovered_files if f["source"] == "HTTP Response"]
+    assert len(http) == 1
+    assert http[0]["size"] == 22
+    assert (out_dir / http[0]["filename"]).read_bytes() == b"body-part-a" + b"body-part-b"
+
+
+def test_http_response_ignores_trailing_bytes(run_tool):
+    body = b"exactly-this-much"
+    response = (
+        b"HTTP/1.1 200 OK\r\n"
+        b"Content-Type: text/plain\r\n"
+        b"Content-Length: " + str(len(body)).encode() + b"\r\n"
+        b"\r\n" + body + b"GET /next HTTP/1.1\r\n\r\n"
+    )
+    tool, out_dir, ok = run_tool(build_pcap([tcp_frame_seq(response, 9000)]))
+    assert ok
+    recovered = [f for f in tool.recovered_files if f["source"] == "HTTP Response"]
+    assert len(recovered) == 1
+    assert (out_dir / recovered[0]["filename"]).read_bytes() == body
+
+
+# --- carve boundaries ------------------------------------------------------
+
+
+def test_rar_carve_stops_at_end_of_archive_record(run_tool):
+    rar = b"Rar!\x1a\x07\x00" + b"encrypted-payload" + RAR_END + b"TRAILING-NOT-PART-OF-IT"
+    tool, out_dir, ok = run_tool(build_pcap([tcp_frame(rar, sport=4444, dport=5555)]))
+    assert ok
+    rars = [p.read_bytes() for p in out_dir.iterdir() if p.suffix == ".rar"]
+    assert rars, "no RAR was carved"
+    assert rars[0] == b"Rar!\x1a\x07\x00" + b"encrypted-payload" + RAR_END
+
+
+def test_bmp_carve_truncated_to_declared_length(run_tool):
+    # 14-byte file header + 40-byte DIB header + pixel data.
+    dib = b"\x00" * 40
+    pixels = b"\x2a" * 40
+    total = 14 + len(dib) + len(pixels)
+    body = (
+        b"BM"
+        + total.to_bytes(4, "little")
+        + b"\x00" * 4
+        + (54).to_bytes(4, "little")
+        + dib
+        + pixels
+    )
+    tool, out_dir, ok = run_tool(build_pcap([tcp_frame(body + b"JUNK", sport=4444, dport=5555)]))
+    assert ok
+    bmps = [p.read_bytes() for p in out_dir.iterdir() if p.suffix == ".bmp"]
+    assert bmps, "no BMP was carved"
+    assert bmps[0] == body
+
+
+def test_bmp_carve_keeps_data_when_declared_length_is_absurd(run_tool):
+    # A false-positive BM hit: the declared size exceeds what we carved, so it
+    # must not be trusted to truncate the carve.
+    carved = b"BM" + (0xFFFFFFFF).to_bytes(4, "little") + b"\x00" * 51
+    tool, out_dir, ok = run_tool(build_pcap([tcp_frame(carved, sport=4444, dport=5555)]))
+    assert ok
+    bmps = [p.read_bytes() for p in out_dir.iterdir() if p.suffix == ".bmp"]
+    assert bmps and bmps[0] == carved
 
 
 # --- happy path -----------------------------------------------------------

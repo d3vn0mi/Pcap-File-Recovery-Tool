@@ -29,3 +29,7 @@ recovered_files/
 .idea/
 .vscode/
 .DS_Store
+/unpacked
+/streams
+/unpacked2
+uv.lock

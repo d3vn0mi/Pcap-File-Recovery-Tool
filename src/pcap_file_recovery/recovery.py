@@ -20,7 +20,7 @@ from collections import defaultdict
 from collections.abc import Iterable
 from datetime import datetime
 
-from scapy.all import DNS, DNSQR, ICMP, IP, TCP, Packet, Raw, rdpcap
+from scapy.all import DNS, DNSQR, ICMP, IP, TCP, IPv6, Packet, Raw, rdpcap
 
 # Conservative allow-list for characters in recovered filenames.
 _UNSAFE_CHARS_RE = re.compile(r"[^A-Za-z0-9._-]")
@@ -29,6 +29,55 @@ _CONTROL_CHARS_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 
 MAX_FILENAME_LENGTH = 120
 RECOVERY_SUMMARY_NAME = "recovery_summary.txt"
+
+_SEQ_MOD = 1 << 32
+_SEQ_HALF = 1 << 31
+
+
+def _order_by_seq(segments: list[tuple[int, bytes]]) -> list[tuple[int, bytes]]:
+    """Sort ``(seq, payload)`` segments into stream order.
+
+    TCP sequence numbers, not capture order, define byte order: a capture can
+    legitimately record a segment before one that precedes it on the wire.
+    Sorting is stable, so segments that all share a sequence number (synthetic
+    fixtures, or a capture that never set one) keep their arrival order.
+
+    The 32-bit space wraps. The largest forward gap in the sorted list is where
+    the stream crossed the wrap point, so rotating after it restores true order.
+    """
+    if len(segments) <= 1:
+        return list(segments)
+
+    ordered = sorted(segments, key=lambda segment: segment[0])
+
+    gaps = [
+        (ordered[(i + 1) % len(ordered)][0] - ordered[i][0]) & (_SEQ_MOD - 1)
+        for i in range(len(ordered))
+    ]
+    widest = max(gaps)
+    if widest > _SEQ_HALF:
+        boundary = gaps.index(widest)
+        ordered = ordered[boundary + 1:] + ordered[: boundary + 1]
+
+    return ordered
+
+
+def reassemble_tcp(segments: list[tuple[int, bytes]]) -> bytes:
+    """Rebuild one direction of a TCP stream from its payload segments.
+
+    Segments are ordered by sequence number and exact retransmissions are
+    dropped, so a stream that was captured out of order -- or one the sender
+    retransmitted -- still reassembles byte-for-byte instead of silently
+    producing a same-length but corrupted buffer.
+    """
+    seen: set[tuple[int, bytes]] = set()
+    chunks: list[bytes] = []
+    for segment in _order_by_seq(segments):
+        if segment in seen:
+            continue  # pure retransmission of bytes we already have
+        seen.add(segment)
+        chunks.append(segment[1])
+    return b"".join(chunks)
 
 
 def sanitize_filename(filename: str) -> str:
@@ -103,48 +152,105 @@ class FileRecoveryTool:
         self.generate_report()
         return True
 
-    def extract_http_files(self, packets: Iterable[Packet]) -> None:
-        """Extract files from HTTP traffic"""
-        print("\n[+] Analyzing HTTP traffic...")
+    def collect_tcp_payloads(self, packets: Iterable[Packet]) -> dict[tuple, list[tuple[int, bytes]]]:
+        """Group TCP payload segments by connection direction.
+
+        The key is the directional 4-tuple ``(src, sport, dst, dport)``, so the
+        two halves of a conversation stay separate. Each value keeps every
+        ``(seq, payload)`` pair so the stream can be ordered on reassembly.
+        """
+        directions: dict[tuple, list[tuple[int, bytes]]] = defaultdict(list)
 
         for packet in packets:
-            if packet.haslayer(TCP) and packet.haslayer(Raw):
-                payload = packet[Raw].load
+            if not (packet.haslayer(TCP) and packet.haslayer(Raw)):
+                continue
+            if packet.haslayer(IP):
+                src, dst = packet[IP].src, packet[IP].dst
+            elif packet.haslayer(IPv6):
+                src, dst = packet[IPv6].src, packet[IPv6].dst
+            else:
+                continue
+            key = (src, int(packet[TCP].sport), dst, int(packet[TCP].dport))
+            directions[key].append((int(packet[TCP].seq), bytes(packet[Raw].load)))
 
-                # Look for HTTP responses with file content
-                if b"HTTP/" in payload and (b"Content-Type:" in payload or b"Content-Disposition:" in payload):
-                    self.extract_http_response(payload)
+        return directions
 
-                # Look for file uploads
-                if b"Content-Disposition: form-data" in payload:
-                    self.extract_http_upload(payload)
+    @staticmethod
+    def iter_http_messages(stream: bytes):
+        """Yield ``(header_block, body)`` for every HTTP/1.x response in a stream.
 
-    def extract_http_response(self, payload: bytes) -> None:
-        """Extract files from HTTP responses"""
-        payload_str = payload.decode("utf-8", errors="ignore")
+        ``Content-Length`` bounds the body when the server sent one; otherwise
+        the body runs to the end of the stream. The stream is already in
+        sequence order, so responses split across segments are parsed whole.
+        """
+        status_line = re.compile(rb"HTTP/1\.[01]\s+\d{3}")
+        position = 0
 
-        # Extract filename from Content-Disposition header
+        while True:
+            match = status_line.search(stream, position)
+            if match is None:
+                return
+
+            header_end = stream.find(b"\r\n\r\n", match.start())
+            if header_end == -1:
+                return  # headers never terminated; nothing further is parseable
+
+            header = stream[match.start():header_end]
+            body_start = header_end + 4
+
+            length = re.search(rb"(?im)^content-length:\s*(\d+)\s*$", header)
+            if length:
+                body = stream[body_start: body_start + int(length.group(1))]
+                position = body_start + len(body)
+            else:
+                body = stream[body_start:]
+                position = len(stream)
+
+            yield header, body
+
+    def extract_http_files(self, packets: Iterable[Packet]) -> None:
+        """Extract files from HTTP traffic.
+
+        HTTP headers and their body routinely straddle TCP segment boundaries,
+        so messages are parsed out of reassembled streams. Scanning packet by
+        packet instead sees the header in one packet (yielding an empty body)
+        and the body in later packets (which carry no headers to anchor on).
+        """
+        print("\n[+] Analyzing HTTP traffic...")
+
+        for segments in self.collect_tcp_payloads(packets).values():
+            stream = reassemble_tcp(segments)
+
+            for header, body in self.iter_http_messages(stream):
+                if b"Content-Type:" in header or b"Content-Disposition:" in header:
+                    self.save_http_object(header, body)
+
+            if b"Content-Disposition: form-data" in stream:
+                self.extract_http_upload(stream)
+
+    def save_http_object(self, header: bytes, body: bytes) -> None:
+        """Persist one HTTP response body, honouring a Content-Disposition filename."""
+        header_str = header.decode("utf-8", errors="ignore")
+
         filename = None
-        content_disp_match = re.search(r"Content-Disposition:.*filename[*]?=([^;\r\n]+)", payload_str, re.IGNORECASE)
+        content_disp_match = re.search(r"Content-Disposition:.*filename[*]?=([^;\r\n]+)", header_str, re.IGNORECASE)
         if content_disp_match:
             filename = content_disp_match.group(1).strip("\"'")
 
-        # Extract content type
-        content_type_match = re.search(r"Content-Type:\s*([^\r\n]+)", payload_str, re.IGNORECASE)
+        content_type_match = re.search(r"Content-Type:\s*([^\r\n]+)", header_str, re.IGNORECASE)
         content_type = content_type_match.group(1) if content_type_match else "unknown"
 
-        # Find the start of file content (after headers)
-        header_end = payload.find(b"\r\n\r\n")
-        if header_end != -1:
-            file_content = payload[header_end + 4:]
+        if not filename:
+            ext = self.get_extension_from_content_type(content_type)
+            filename = f"http_file_{len(self.recovered_files)}.{ext}"
 
-            if filename:
-                self.save_recovered_file(filename, file_content, "HTTP Response")
-            else:
-                # Generate filename based on content type
-                ext = self.get_extension_from_content_type(content_type)
-                filename = f"http_file_{len(self.recovered_files)}.{ext}"
-                self.save_recovered_file(filename, file_content, "HTTP Response")
+        self.save_recovered_file(filename, body, "HTTP Response")
+
+    def extract_http_response(self, payload: bytes) -> None:
+        """Extract a file from a single self-contained HTTP response payload."""
+        for header, body in self.iter_http_messages(payload):
+            self.save_http_object(header, body)
+            return
 
     def extract_http_upload(self, payload: bytes) -> None:
         """Extract files from HTTP uploads"""
@@ -174,7 +280,7 @@ class FileRecoveryTool:
         """Extract files from FTP traffic"""
         print("\n[+] Analyzing FTP traffic...")
 
-        ftp_data_streams: dict[str, list[bytes]] = defaultdict(list)
+        ftp_data_streams: dict[str, list[tuple[int, bytes]]] = defaultdict(list)
 
         for packet in packets:
             if packet.haslayer(TCP):
@@ -193,12 +299,12 @@ class FileRecoveryTool:
                     if packet.haslayer(Raw) and packet.haslayer(IP):
                         # This is likely file data
                         stream_id = f"{packet[IP].src}:{packet[TCP].sport}-{packet[IP].dst}:{packet[TCP].dport}"
-                        ftp_data_streams[stream_id].append(packet[Raw].load)
+                        ftp_data_streams[stream_id].append((int(packet[TCP].seq), bytes(packet[Raw].load)))
 
         # Save FTP data streams
         for i, chunks in enumerate(ftp_data_streams.values()):
             filename = f"ftp_transfer_{i}.bin"
-            self.save_recovered_file(filename, b"".join(chunks), "FTP Transfer")
+            self.save_recovered_file(filename, reassemble_tcp(chunks), "FTP Transfer")
 
     def extract_smtp_files(self, packets: Iterable[Packet]) -> None:
         """Extract email attachments from SMTP traffic"""
@@ -237,20 +343,17 @@ class FileRecoveryTool:
                                     self.save_recovered_file(filename, decoded_data, "SMTP Attachment")
 
     def extract_tcp_streams(self, packets: Iterable[Packet]) -> None:
-        """Extract files from TCP streams by looking for file signatures"""
+        """Extract files from TCP streams by looking for file signatures.
+
+        Streams are rebuilt in sequence order before scanning. Concatenating
+        payloads in capture order instead yields a buffer of exactly the right
+        length with the segments transposed, which defeats every integrity check
+        downstream (archive CRC, image decoders) without raising anything.
+        """
         print("\n[+] Analyzing TCP streams for file signatures...")
 
-        tcp_streams: dict[tuple, list[bytes]] = defaultdict(list)
-
-        for packet in packets:
-            if packet.haslayer(TCP) and packet.haslayer(Raw) and packet.haslayer(IP):
-                # Group by TCP stream
-                stream_key = (packet[IP].src, packet[IP].dst, packet[TCP].sport, packet[TCP].dport)
-                tcp_streams[stream_key].append(packet[Raw].load)
-
-        # Analyze each stream
-        for i, data_list in enumerate(tcp_streams.values()):
-            stream_data = b"".join(data_list)
+        for i, segments in enumerate(self.collect_tcp_payloads(packets).values()):
+            stream_data = reassemble_tcp(segments)
 
             # Look for file signatures in the stream
             files_found = self.find_files_by_signature(stream_data)
@@ -315,15 +418,44 @@ class FileRecoveryTool:
             filename = f"signature_found_{i}.{file_type.lower()}"
             self.save_recovered_file(filename, file_data, f"File Signature ({file_type})")
 
+    @staticmethod
+    def _find_earliest(data: bytes, markers: tuple[bytes, ...], start: int) -> int:
+        """Return the offset of the first marker at or after ``start``, else -1."""
+        best = -1
+        for marker in markers:
+            position = data.find(marker, start)
+            if position != -1 and (best == -1 or position < best):
+                best = position
+        return best
+
+    @staticmethod
+    def _truncate_bmp(carved: bytes) -> bytes:
+        """Cut a BMP carve back to the file size declared in its header.
+
+        A bare ``BM`` hit in arbitrary traffic is usually a false positive, so
+        the declared size is honoured only when it is self-consistent: a real
+        BMP is at least a 14-byte file header plus a 40-byte DIB header, and a
+        length larger than the bytes we actually carved means the header is
+        noise rather than a genuine bitmap.
+        """
+        if len(carved) < 54:
+            return carved
+        declared = int.from_bytes(carved[2:6], "little")
+        if 54 <= declared <= len(carved):
+            return carved[:declared]
+        return carved
+
     def find_files_by_signature(self, data: bytes) -> list[tuple[bytes, str]]:
         """Find files in data by their magic number signatures"""
-        file_signatures: dict[bytes, tuple[str, bytes, bytes | None]] = {
-            b"\x89PNG\r\n\x1a\n": ("PNG", b"\x89PNG\r\n\x1a\n", b"IEND\xaeB`\x82"),
-            b"\xff\xd8\xff": ("JPG", b"\xff\xd8\xff", b"\xff\xd9"),
-            b"GIF8": ("GIF", b"GIF8", b"\x00\x3b"),
-            b"%PDF": ("PDF", b"%PDF", b"%%EOF"),
-            b"PK\x03\x04": ("ZIP", b"PK\x03\x04", b"PK\x05\x06"),
-            b"Rar!": ("RAR", b"Rar!", None),
+        file_signatures: dict[bytes, tuple[str, bytes, tuple[bytes, ...] | None]] = {
+            b"\x89PNG\r\n\x1a\n": ("PNG", b"\x89PNG\r\n\x1a\n", (b"IEND\xaeB`\x82",)),
+            b"\xff\xd8\xff": ("JPG", b"\xff\xd8\xff", (b"\xff\xd9",)),
+            b"GIF8": ("GIF", b"GIF8", (b"\x00\x3b",)),
+            b"%PDF": ("PDF", b"%PDF", (b"%%EOF",)),
+            b"PK\x03\x04": ("ZIP", b"PK\x03\x04", (b"PK\x05\x06",)),
+            # RAR ends with an end-of-archive record, so a carve can stop there
+            # instead of absorbing every byte that follows on the wire.
+            b"Rar!": ("RAR", b"Rar!", (b"\xc4\x3d\x7b\x00\x40\x07\x00", b"\xc4\x3d\x7b\x01\x40\x07\x00")),
             b"\x1f\x8b\x08": ("GZ", b"\x1f\x8b\x08", None),
             b"BM": ("BMP", b"BM", None),
             b"\x00\x00\x01\x00": ("ICO", b"\x00\x00\x01\x00", None),
@@ -335,7 +467,7 @@ class FileRecoveryTool:
 
         found_files: list[tuple[bytes, str]] = []
 
-        for signature, (file_type, _start_sig, end_sig) in file_signatures.items():
+        for signature, (file_type, _start_sig, end_markers) in file_signatures.items():
             start_pos = 0
 
             while True:
@@ -343,20 +475,29 @@ class FileRecoveryTool:
                 if pos == -1:
                     break
 
-                if end_sig:
-                    end_pos = data.find(end_sig, pos + len(signature))
+                if end_markers:
+                    end_pos = self._find_earliest(data, end_markers, pos + len(signature))
                     if end_pos != -1:
-                        file_data = data[pos:end_pos + len(end_sig)]
+                        end_len = max(len(m) for m in end_markers)
+                        file_data = data[pos:end_pos + end_len]
+                        if file_type == "BMP":
+                            file_data = self._truncate_bmp(file_data)
                         found_files.append((file_data, file_type))
-                        start_pos = end_pos + len(end_sig)
+                        start_pos = end_pos + end_len
                     else:
                         # Take a reasonable chunk if no end signature found
                         file_data = data[pos:pos + min(self.max_carve_size, len(data) - pos)]
+                        if file_type == "BMP":
+                            file_data = self._truncate_bmp(file_data)
                         found_files.append((file_data, file_type))
                         start_pos = pos + len(signature)
                 else:
-                    # For files without clear end signatures, take a reasonable chunk
+                    # For files without a clear end signature, take a reasonable
+                    # chunk -- truncated at the length the format declares when
+                    # that length is credible.
                     file_data = data[pos:pos + min(self.max_carve_size, len(data) - pos)]
+                    if file_type == "BMP":
+                        file_data = self._truncate_bmp(file_data)
                     found_files.append((file_data, file_type))
                     start_pos = pos + len(signature)
 
